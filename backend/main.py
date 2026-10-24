@@ -27,7 +27,8 @@ def init():
   task_columns={r['name'] for r in c.execute('PRAGMA table_info(tasks)')}
   if 'assignee_user_id' not in task_columns:c.execute('ALTER TABLE tasks ADD COLUMN assignee_user_id TEXT REFERENCES users(id) ON DELETE SET NULL')
   c.executescript('''CREATE TABLE IF NOT EXISTS download_history(id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,downloaded TEXT NOT NULL,UNIQUE(user_id,project_id));CREATE TABLE IF NOT EXISTS revival_requests(id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,message TEXT DEFAULT '',status TEXT NOT NULL DEFAULT 'Pending',created TEXT NOT NULL,UNIQUE(user_id,project_id));''')
-  c.executescript('''CREATE TABLE IF NOT EXISTS project_versions(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,version INTEGER NOT NULL,archive_path TEXT NOT NULL,note TEXT DEFAULT '',created TEXT NOT NULL,UNIQUE(project_id,version));CREATE TABLE IF NOT EXISTS project_members(project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,joined TEXT NOT NULL,PRIMARY KEY(project_id,user_id));CREATE TABLE IF NOT EXISTS project_chat(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,role TEXT NOT NULL,content TEXT NOT NULL,created TEXT NOT NULL);''')
+  c.executescript('''CREATE TABLE IF NOT EXISTS project_versions(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,version INTEGER NOT NULL,archive_path TEXT NOT NULL,note TEXT DEFAULT '',created TEXT NOT NULL,UNIQUE(project_id,version));CREATE TABLE IF NOT EXISTS project_members(project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,joined TEXT NOT NULL,PRIMARY KEY(project_id,user_id));CREATE TABLE IF NOT EXISTS project_chat(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,role TEXT NOT NULL,content TEXT NOT NULL,created TEXT NOT NULL);CREATE TABLE IF NOT EXISTS ai_change_proposals(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,changes TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'pending',created TEXT NOT NULL,applied_version INTEGER);CREATE TABLE IF NOT EXISTS project_progress(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,completion INTEGER NOT NULL,completed_tasks INTEGER NOT NULL,total_tasks INTEGER NOT NULL,created TEXT NOT NULL);''')
+  c.execute("INSERT OR IGNORE INTO project_versions(id,project_id,version,archive_path,note,created) SELECT lower(hex(randomblob(16))),id,1,archive_path,'Initial upload',created FROM projects WHERE archive_path IS NOT NULL")
 init()
 def now():return datetime.datetime.now(datetime.timezone.utc).isoformat()
 def hash_password(password,salt=None):
@@ -54,7 +55,7 @@ def token_user(token):
 @app.middleware('http')
 async def require_auth_and_ownership(request:Request,call_next):
  path=request.url.path
- if request.method=='OPTIONS' or path in ('/api/health','/api/auth/signup','/api/auth/login','/api/discover'):
+ if request.method=='OPTIONS' or path in ('/api/health','/api/ai/status','/api/auth/signup','/api/auth/login','/api/discover'):
   return await call_next(request)
  if not path.startswith('/api/'):return await call_next(request)
  header=request.headers.get('authorization','');user=token_user(header[7:]) if header.lower().startswith('bearer ') else None
@@ -72,14 +73,25 @@ async def require_auth_and_ownership(request:Request,call_next):
   public_request=endpoint=='revival-requests' and request.method=='POST' and bool(project['is_public'])
   with conn() as c:member=c.execute('SELECT 1 FROM project_members WHERE project_id=? AND user_id=?',(project_id,user['id'])).fetchone()
   ai_action=parts[5] if endpoint=='ai' and len(parts)>5 else ''
-  collaborative_route=endpoint=='tasks' or (endpoint=='ai' and ai_action in ('chat','messages')) or (endpoint=='versions' and request.method=='GET')
-  if not public_read and not public_versions and not public_download and not public_request and project['owner_id']!=user['id'] and not (member and collaborative_route):
+  private_chat_history=endpoint=='ai' and ai_action=='messages' and request.method=='GET'
+  collaborative_route=endpoint in ('tasks','files','members') or (endpoint=='ai' and ai_action in ('chat','messages')) or (endpoint=='versions' and request.method=='GET')
+  if not public_read and not public_versions and not public_download and not public_request and not private_chat_history and project['owner_id']!=user['id'] and not (member and collaborative_route):
    return JSONResponse({'detail':'You do not have access to this project.'},status_code=403)
  return await call_next(request)
+LANGUAGE_BY_EXTENSION={'.py':'Python','.html':'HTML','.htm':'HTML','.css':'CSS','.js':'JavaScript','.jsx':'JavaScript','.mjs':'JavaScript','.cjs':'JavaScript','.ts':'TypeScript','.tsx':'TypeScript','.java':'Java','.cpp':'C/C++','.c':'C','.h':'C/C++','.json':'JSON','.md':'Markdown','.txt':'Text','.sql':'SQL','.yml':'YAML','.yaml':'YAML','.toml':'TOML','.vue':'Vue','.go':'Go','.rs':'Rust'}
 def rowproject(c,id):
  r=c.execute('SELECT * FROM projects WHERE id=?',(id,)).fetchone()
  if not r:raise HTTPException(404,'Project not found')
- d=dict(r);d.pop('owner_id',None);d['technologies']=json.loads(d['technologies']);d['analysis']=json.loads(d['analysis']);d['ai_review']=json.loads(d['ai_review']);d['tasks']=[dict(t) for t in c.execute('SELECT t.*,u.name AS assignee_name FROM tasks t LEFT JOIN users u ON u.id=t.assignee_user_id WHERE t.project_id=? ORDER BY t.position',(id,))];d['files']=[{'id':f['id'],'path':f['path'],'size':f['size']} for f in c.execute('SELECT id,path,size FROM files WHERE project_id=? ORDER BY path',(id,))];d['progress']=round(100*sum(t['done'] for t in d['tasks'])/len(d['tasks'])) if d['tasks'] else 0;return d
+ d=dict(r);d.pop('owner_id',None);d['technologies']=json.loads(d['technologies']);d['analysis']=json.loads(d['analysis']);d['ai_review']=json.loads(d['ai_review']);d['tasks']=[dict(t) for t in c.execute('SELECT t.*,u.name AS assignee_name FROM tasks t LEFT JOIN users u ON u.id=t.assignee_user_id WHERE t.project_id=? ORDER BY t.position',(id,))];d['files']=[{'id':f['id'],'path':f['path'],'size':f['size']} for f in c.execute('SELECT id,path,size FROM files WHERE project_id=? ORDER BY path',(id,))]
+ languages=collections.Counter(LANGUAGE_BY_EXTENSION.get(Path(file['path']).suffix.lower(),'Other') for file in d['files'])
+ d['file_stats']={'total_files':len(d['files']),'total_bytes':sum(file['size'] for file in d['files']),'languages':dict(sorted(languages.items()))}
+ d['progress']=round(100*sum(t['done'] for t in d['tasks'])/len(d['tasks'])) if d['tasks'] else 0;return d
+def record_project_progress(c,project_id,created=None):
+ project=c.execute('SELECT completion FROM projects WHERE id=?',(project_id,)).fetchone()
+ if not project:return
+ counts=c.execute('SELECT COUNT(*) AS total,COALESCE(SUM(done),0) AS completed FROM tasks WHERE project_id=?',(project_id,)).fetchone()
+ total=counts['total'];completed=counts['completed'];completion=round(100*completed/total) if total else project['completion']
+ c.execute('INSERT INTO project_progress(id,project_id,completion,completed_tasks,total_tasks,created) VALUES(?,?,?,?,?,?)',(uuid.uuid4().hex,project_id,completion,completed,total,created or now()))
 def save(name,description,source,repo='',files=None,owner_id=None,category='Other',technologies=None,completion=0,archive=None):
  id=uuid.uuid4().hex;ts=now();files=files or [];archive_path=None
  if archive:
@@ -89,6 +101,7 @@ def save(name,description,source,repo='',files=None,owner_id=None,category='Othe
   c.executemany('INSERT INTO files(id,project_id,path,content,size) VALUES(?,?,?,?,?)',[(uuid.uuid4().hex,id,p,content[:18000],size) for p,content,size in files])
   if archive_path:
    c.execute('INSERT INTO project_versions(id,project_id,version,archive_path,note,created) VALUES(?,?,?,?,?,?)',(uuid.uuid4().hex,id,1,str(archive_path),'Initial upload',ts))
+  record_project_progress(c,id,ts)
  return id
 IGNORED={'.git','node_modules','dist','build','venv','.venv','__pycache__','.next','coverage'}
 EXTS={'.py','.js','.jsx','.ts','.tsx','.java','.cpp','.c','.h','.html','.css','.json','.md','.txt','.sql','.yml','.yaml','.toml','.env.example','.vue','.go','.rs'}
@@ -115,7 +128,10 @@ class Credentials(BaseModel):email:str=Field(min_length=5,max_length=254);passwo
 class LoginInput(BaseModel):email:str=Field(min_length=5,max_length=254);password:str=Field(min_length=8,max_length=128)
 class ProfileInput(BaseModel):name:str=Field(min_length=1,max_length=100);skills:list[str]=Field(default_factory=list)
 class RevivalRequest(BaseModel):message:str=Field(default='',max_length=2000)
-def user_payload(user):return {'user':{'id':user['id'],'email':user['email'],'name':user['name'],'created':user['created'],'skills':json.loads(user['skills']) if 'skills' in user.keys() else []},'token':token_for(user)}
+def user_payload(user):
+ skills=user['skills'] if 'skills' in user.keys() else []
+ if isinstance(skills,str):skills=json.loads(skills)
+ return {'user':{'id':user['id'],'email':user['email'],'name':user['name'],'created':user['created'],'skills':skills},'token':token_for(user)}
 def parse_technologies(value):
  try:items=json.loads(value) if isinstance(value,str) else value
  except json.JSONDecodeError:items=[]
@@ -150,6 +166,8 @@ def update_profile(p:ProfileInput,request:Request):
   user=dict(c.execute('SELECT id,email,name,created,skills FROM users WHERE id=?',(request.state.user['id'],)).fetchone());user['skills']=json.loads(user['skills']);return user
 @app.get('/api/health')
 def health():return {'ok':True,'database':'sqlite'}
+@app.get('/api/ai/status')
+def ai_status():return {'configured':bool(os.getenv('OPENAI_API_KEY') or os.getenv('AI_API_KEY')),'model':os.getenv('OPENAI_MODEL','gpt-4o-mini')}
 @app.get('/api/projects')
 def projects(request:Request):
  with conn() as c:return [rowproject(c,r['id']) for r in c.execute('SELECT id FROM projects WHERE owner_id=? ORDER BY updated DESC',(request.state.user['id'],))]
@@ -189,8 +207,10 @@ async def github(p:Repo,request:Request):
 def get_project(id:str,request:Request):
  with conn() as c:
   result=rowproject(c,id)
-  if c.execute('SELECT owner_id FROM projects WHERE id=?',(id,)).fetchone()['owner_id']!=request.state.user['id']:
-   return {k:result[k] for k in ('id','name','description','source','repo','created','updated','status','category','technologies','completion','download_count','analysis','progress')}
+  access=c.execute('SELECT owner_id FROM projects WHERE id=?',(id,)).fetchone();member=c.execute('SELECT 1 FROM project_members WHERE project_id=? AND user_id=?',(id,request.state.user['id'])).fetchone()
+  result['is_member']=bool(member)
+  if access['owner_id']!=request.state.user['id'] and not member:
+   return {k:result[k] for k in ('id','name','description','source','repo','created','updated','status','category','technologies','completion','download_count','analysis','ai_review','progress','is_member')}
   return result
 @app.get('/api/discover')
 def discover(q:str='',category:str='',technology:str='',limit:int=60):
@@ -207,10 +227,26 @@ def dashboard(request:Request):
  with conn() as c:
   projects=[rowproject(c,r['id']) for r in c.execute('SELECT id FROM projects WHERE owner_id=? ORDER BY updated DESC',(user_id,))]
   downloads=c.execute('SELECT COUNT(*) FROM download_history WHERE user_id=?',(user_id,)).fetchone()[0]
-  activity=[{'kind':'upload','project_id':p['id'],'project_name':p['name'],'created':p['updated']} for p in projects[:5]]
+  activity=[]
+  for project in projects:
+   activity.append({'kind':'upload','project_id':project['id'],'project_name':project['name'],'created':project['created']})
+   if project['updated'] and project['updated']>project['created']:activity.append({'kind':'update','project_id':project['id'],'project_name':project['name'],'created':project['updated']})
   activity.extend({'kind':'download','project_id':r['id'],'project_name':r['name'],'created':r['downloaded']} for r in c.execute('SELECT p.id,p.name,d.downloaded FROM download_history d JOIN projects p ON p.id=d.project_id WHERE d.user_id=? ORDER BY d.downloaded DESC LIMIT 5',(user_id,)))
   activity.sort(key=lambda x:x['created'],reverse=True)
-  return {'stats':{'uploads':len(projects),'active':sum(p['status']=='Reviving' for p in projects),'completed':sum(p['status']=='Completed' for p in projects),'downloads':downloads},'projects':projects[:5],'activity':activity[:8]}
+  languages=collections.Counter(language for project in projects for language,count in project['file_stats']['languages'].items() for _ in range(count))
+  technologies=collections.Counter(technology for project in projects for technology in project['technologies'])
+  statuses=collections.Counter(project['status'] or 'Unspecified' for project in projects)
+  file_count=sum(project['file_stats']['total_files'] for project in projects)
+  file_bytes=sum(project['file_stats']['total_bytes'] for project in projects)
+  completed_tasks=sum(task['done'] for project in projects for task in project['tasks'])
+  pending_tasks=sum(not task['done'] for project in projects for task in project['tasks'])
+  project_ids=[project['id'] for project in projects]
+  if project_ids:
+   placeholders=','.join('?' for _ in project_ids)
+   progress_history=[dict(row) for row in c.execute(f'SELECT h.project_id,p.name AS project_name,h.completion,h.completed_tasks,h.total_tasks,h.created FROM project_progress h JOIN projects p ON p.id=h.project_id WHERE h.project_id IN ({placeholders}) ORDER BY h.created DESC LIMIT 80',project_ids)]
+   progress_history.reverse()
+  else:progress_history=[]
+  return {'stats':{'uploads':len(projects),'active':sum(p['status']=='Reviving' for p in projects),'completed':sum(p['status']=='Completed' for p in projects),'downloads':downloads,'files':file_count,'bytes':file_bytes,'completed_tasks':completed_tasks,'pending_tasks':pending_tasks,'languages':dict(sorted(languages.items())),'technologies':dict(sorted(technologies.items())),'statuses':dict(sorted(statuses.items())),'progress_history':progress_history},'projects':projects[:5],'activity':activity[:8]}
 @app.get('/api/downloads')
 def downloads(request:Request):
  with conn() as c:
@@ -371,25 +407,120 @@ async def ai_roadmap(id:str,p:Direction,request:Request):
  with conn() as c:
   require_project_owner(c,id,request.state.user['id']);c.execute('DELETE FROM tasks WHERE project_id=?',(id,))
   for index,(title,detail,priority) in enumerate(tasks):c.execute('INSERT INTO tasks(id,project_id,title,detail,priority,position) VALUES(?,?,?,?,?,?)',(uuid.uuid4().hex,id,title,detail,priority,index))
-  c.execute('UPDATE projects SET direction=?,status=?,updated=? WHERE id=?',(p.direction,'Reviving',now(),id));return rowproject(c,id)
+  c.execute('UPDATE projects SET direction=?,status=?,updated=? WHERE id=?',(p.direction,'Reviving',now(),id));record_project_progress(c,id);return rowproject(c,id)
 class ChatInput(BaseModel):message:str=Field(min_length=1,max_length=4000)
+MAX_EDIT_BYTES=18000
 @app.get('/api/projects/{id}/ai/messages')
 def ai_messages(id:str,request:Request):
  with conn() as c:return [dict(r) for r in c.execute('SELECT role,content,created FROM project_chat WHERE project_id=? AND user_id=? ORDER BY created',(id,request.state.user['id']))]
 @app.post('/api/projects/{id}/ai/chat')
 async def ai_chat(id:str,p:ChatInput,request:Request):
  with conn() as c:
-  project=rowproject(c,id);files=[dict(r) for r in c.execute('SELECT path,content FROM files WHERE project_id=? ORDER BY path LIMIT 30',(id,))]
+  project=rowproject(c,id);files=[dict(r) for r in c.execute('SELECT path,content,size FROM files WHERE project_id=? ORDER BY path LIMIT 40',(id,))]
   history=[dict(r) for r in c.execute('SELECT role,content FROM project_chat WHERE project_id=? AND user_id=? ORDER BY created DESC LIMIT 10',(id,request.state.user['id']))]
- context={'name':project['name'],'description':project['description'],'technologies':project['technologies'],'files':[{'path':f['path'],'excerpt':f['content'][:1800]} for f in files]}
- messages=[{'role':'system','content':'You are the REVIVE-OS coding assistant. Help with this project using only the context below. Be direct, provide concrete suggestions and explain uncertainty. You cannot execute the code or inspect files not included here. Project context: '+json.dumps(context)}]
+  owner=c.execute('SELECT owner_id FROM projects WHERE id=?',(id,)).fetchone()['owner_id']==request.state.user['id']
+ context={'name':project['name'],'description':project['description'],'category':project['category'],'status':project['status'],'technologies':project['technologies'],'file_stats':project['file_stats'],'files':[{'path':f['path'],'size':f['size'],'excerpt':f['content'][:3000]} for f in files]}
+ messages=[{'role':'system','content':'You are SHARTI, REVIVE-OS project-aware coding assistant. Help with architecture, code explanation, bugs, implementation steps, UX and realistic improvements using only the supplied project context. Be specific and note uncertainty; never claim code was executed. Reply with a JSON object containing reply (Markdown text), file_references (array of exact supplied paths), and proposed_changes (array). Only return proposed_changes when the user explicitly requests a code change. Each change must have path, action (modify or add), reason and complete content. Never delete files or invent existing paths. Project context: '+json.dumps(context)}]
  messages.extend({'role':row['role'],'content':row['content']} for row in reversed(history));messages.append({'role':'user','content':p.message.strip()})
- answer=await ai_completion(messages,1400)
- if not isinstance(answer,str) or not answer.strip():raise HTTPException(502,'The AI provider returned an empty response.')
+ answer=ai_json(await ai_completion(messages,4600,True));reply=answer.get('reply');proposed=answer.get('proposed_changes',[]);references=answer.get('file_references',[])
+ if not isinstance(reply,str) or not reply.strip() or not isinstance(proposed,list) or not isinstance(references,list):raise HTTPException(502,'SHARTI returned an incomplete response.')
+ proposal=None
+ if proposed:
+  if not owner:raise HTTPException(403,'Only the project owner can prepare code changes.')
+  if len(proposed)>6:raise HTTPException(502,'SHARTI proposed too many files. Ask it to split the change.')
+  known={file['path']:file for file in files};known_casefold={path.casefold():path for path in known};seen=set();changes=[]
+  for item in proposed:
+   if not isinstance(item,dict):raise HTTPException(502,'SHARTI returned an invalid change. No proposal was saved.')
+   path=str(item.get('path','')).replace('\\','/').strip();action=item.get('action');content=item.get('content');reason=str(item.get('reason',''))[:500]
+   if not path or not safe_path(path) or Path(path).suffix.lower() not in EXTS or path.casefold() in seen or not isinstance(content,str) or len(content.encode('utf-8'))>MAX_EDIT_BYTES:raise HTTPException(502,'SHARTI returned an unsafe or oversized change. No proposal was saved.')
+   seen.add(path.casefold());existing_path=known_casefold.get(path.casefold())
+   if action=='modify':
+    if not existing_path:raise HTTPException(502,f'SHARTI tried to modify a file not present in the project: {path}.')
+    original=known[existing_path]['content']
+    if known[existing_path]['size']>MAX_EDIT_BYTES:raise HTTPException(422,f'{path} is too large for a safe full-file proposal.')
+    changes.append({'path':existing_path,'action':'modify','reason':reason,'before':original,'after':content,'base_hash':hashlib.sha256(original.encode()).hexdigest()})
+   elif action=='add':
+    if existing_path:raise HTTPException(502,f'SHARTI tried to add a file that already exists: {existing_path}.')
+    changes.append({'path':path,'action':'add','reason':reason,'before':None,'after':content,'base_hash':None})
+   else:raise HTTPException(502,'SHARTI returned an unsupported change action.')
+  proposal={'id':uuid.uuid4().hex,'changes':changes,'status':'pending','created':now()}
  created=now()
  with conn() as c:
-  c.executemany('INSERT INTO project_chat(id,project_id,user_id,role,content,created) VALUES(?,?,?,?,?,?)',[(uuid.uuid4().hex,id,request.state.user['id'],'user',p.message.strip(),created),(uuid.uuid4().hex,id,request.state.user['id'],'assistant',answer.strip()[:12000],created)])
- return {'role':'assistant','content':answer.strip(),'created':created}
+  c.executemany('INSERT INTO project_chat(id,project_id,user_id,role,content,created) VALUES(?,?,?,?,?,?)',[(uuid.uuid4().hex,id,request.state.user['id'],'user',p.message.strip(),created),(uuid.uuid4().hex,id,request.state.user['id'],'assistant',reply.strip()[:12000],created)])
+  if proposal:c.execute('INSERT INTO ai_change_proposals(id,project_id,user_id,changes,status,created) VALUES(?,?,?,?,?,?)',(proposal['id'],id,request.state.user['id'],json.dumps(proposal['changes']),proposal['status'],proposal['created']))
+ return {'role':'assistant','content':reply.strip(),'created':created,'file_references':[path for path in references if isinstance(path,str) and path in {file['path'] for file in files}],'proposal':proposal}
+@app.get('/api/projects/{id}/ai/proposals')
+def ai_proposals(id:str,request:Request):
+ with conn() as c:
+  require_project_owner(c,id,request.state.user['id'])
+  return [{'id':row['id'],'changes':json.loads(row['changes']),'status':row['status'],'created':row['created'],'applied_version':row['applied_version']} for row in c.execute("SELECT id,changes,status,created,applied_version FROM ai_change_proposals WHERE project_id=? AND user_id=? AND status='pending' ORDER BY created DESC",(id,request.state.user['id']))]
+@app.delete('/api/projects/{id}/ai/proposals/{proposal_id}')
+def reject_ai_proposal(id:str,proposal_id:str,request:Request):
+ with conn() as c:
+  require_project_owner(c,id,request.state.user['id'])
+  result=c.execute("UPDATE ai_change_proposals SET status='rejected' WHERE id=? AND project_id=? AND user_id=? AND status='pending'",(proposal_id,id,request.state.user['id']))
+  if not result.rowcount:raise HTTPException(404,'Pending SHARTI proposal not found.')
+  return {'rejected':True}
+@app.post('/api/projects/{id}/ai/proposals/{proposal_id}/apply')
+def apply_ai_proposal(id:str,proposal_id:str,request:Request):
+ with conn() as c:
+  require_project_owner(c,id,request.state.user['id'])
+  row=c.execute('SELECT changes,status FROM ai_change_proposals WHERE id=? AND project_id=? AND user_id=?',(proposal_id,id,request.state.user['id'])).fetchone()
+  project=c.execute('SELECT archive_path FROM projects WHERE id=?',(id,)).fetchone()
+  if not row:raise HTTPException(404,'SHARTI proposal not found.')
+  if row['status']!='pending':raise HTTPException(409,'This SHARTI proposal has already been handled.')
+  changes=json.loads(row['changes']);files={item['path']:dict(item) for item in c.execute('SELECT path,content,size FROM files WHERE project_id=?',(id,))}
+  for change in changes:
+   current=files.get(change['path'])
+   if change['action']=='modify' and (not current or hashlib.sha256(current['content'].encode()).hexdigest()!=change['base_hash']):raise HTTPException(409,f'{change["path"]} changed since the proposal was created.')
+   if change['action']=='add' and current:raise HTTPException(409,f'{change["path"]} now exists.')
+  archive_path=Path(project['archive_path']) if project['archive_path'] else None;has_archive=bool(archive_path and archive_path.is_file());entries=[]
+  if has_archive:
+   try:
+    with zipfile.ZipFile(archive_path) as source:
+     for info in source.infolist():
+      path=info.filename.replace('\\','/')
+      if info.is_dir():continue
+      if Path(path).is_absolute() or re.match(r'^[A-Za-z]:',path) or '..' in Path(path).parts or path.startswith('/') or (info.external_attr>>16)&0o170000==0o120000:raise HTTPException(409,'The original archive contains an unsafe path.')
+      entries.append((path,info,source.read(info)))
+   except zipfile.BadZipFile:raise HTTPException(409,'The original project archive is invalid.')
+  else:entries=[(path,None,item['content'].encode()) for path,item in files.items()]
+  paths={path for path,_,_ in entries};replacement={item['path']:item['after'].encode() for item in changes}
+  for change in changes:
+   if change['action']=='modify' and change['path'] not in paths:raise HTTPException(409,f'{change["path"]} is missing from the current archive.')
+   if change['action']=='add' and change['path'] in paths:raise HTTPException(409,f'{change["path"]} already exists in the archive.')
+  output=io.BytesIO()
+  with zipfile.ZipFile(output,'w',zipfile.ZIP_DEFLATED) as updated:
+   for path,info,content in entries:updated.writestr(info if info else path,replacement.get(path,content))
+   for change in changes:
+    if change['action']=='add':updated.writestr(change['path'],replacement[change['path']])
+  archive=output.getvalue()
+  if len(archive)>MAX_BYTES:raise HTTPException(413,'The approved project archive would exceed 15 MB.')
+  extracted=parse_zip(archive)
+  claimed=c.execute("UPDATE ai_change_proposals SET status='applying' WHERE id=? AND status='pending'",(proposal_id,))
+  if not claimed.rowcount:raise HTTPException(409,'This SHARTI proposal has already been handled.')
+  version=c.execute('SELECT COALESCE(MAX(version),0)+1 FROM project_versions WHERE project_id=?',(id,)).fetchone()[0]
+  baseline_version=version if not has_archive else None;version+=0 if has_archive else 1;created=now();new_path=UPLOADS/f'{id}-v{version}-{uuid.uuid4().hex[:8]}.zip';backup_path=None
+  try:
+   if not has_archive:
+    baseline=io.BytesIO()
+    with zipfile.ZipFile(baseline,'w',zipfile.ZIP_DEFLATED) as snapshot:
+     for path,item in files.items():snapshot.writestr(path,item['content'])
+    backup_path=UPLOADS/f'{id}-v{baseline_version}-{uuid.uuid4().hex[:8]}.zip';backup_path.write_bytes(baseline.getvalue())
+    c.execute('INSERT INTO project_versions(id,project_id,version,archive_path,note,created) VALUES(?,?,?,?,?,?)',(uuid.uuid4().hex,id,baseline_version,str(backup_path),'Before SHARTI changes',created))
+   new_path.write_bytes(archive)
+   c.execute('INSERT INTO project_versions(id,project_id,version,archive_path,note,created) VALUES(?,?,?,?,?,?)',(uuid.uuid4().hex,id,version,str(new_path),'SHARTI approved changes',created))
+   c.execute('UPDATE projects SET archive_path=?,updated=? WHERE id=?',(str(new_path),created,id))
+   for path,content,size in extracted:
+    existing=c.execute('SELECT id FROM files WHERE project_id=? AND path=?',(id,path)).fetchone()
+    if existing:c.execute('UPDATE files SET content=?,size=? WHERE id=?',(content[:MAX_EDIT_BYTES],size,existing['id']))
+    else:c.execute('INSERT INTO files(id,project_id,path,content,size) VALUES(?,?,?,?,?)',(uuid.uuid4().hex,id,path,content[:MAX_EDIT_BYTES],size))
+   c.execute("UPDATE ai_change_proposals SET status='applied',applied_version=? WHERE id=? AND status='applying'",(version,proposal_id))
+   return rowproject(c,id)
+  except Exception:
+   new_path.unlink(missing_ok=True)
+   if backup_path:backup_path.unlink(missing_ok=True)
+   raise
 @app.post('/api/projects/{id}/analyse')
 def autopsy(id:str):
  with conn() as c:
@@ -404,7 +535,7 @@ def roadmap(id:str,p:Direction):
   common={'Continue':[('Revisit existing source','Map working modules and document the current state'),('Resolve identified blockers','Address: '+('; '.join(gaps) or 'review and confirm pending work')),('Implement pending functionality','Complete the highest-value remaining feature'),('Test integration','Run manual functional tests and add automated tests'),('Deploy and document','Prepare a working demo and update README')], 'Restart':[('Define minimum viable scope','Write a smaller achievable specification'),('Reuse valuable assets','Identify reusable code and designs'),('Set up clean foundation','Initialize structure, dependencies and version control'),('Implement core user journey','Build and verify a complete vertical slice'),('Test and release','Document and demonstrate the new build')], 'Pivot':[('Identify transferable strengths','List reusable components and user needs'),('Choose new problem','Define revised audience and goal'),('Redesign minimal scope','Write new requirements'),('Adapt implementation','Reuse code where appropriate'),('Validate revised direction','Test with a sample user')], 'Repurpose':[('Inventory reusable modules','Identify independent components'),('Select new destination','Choose a suitable project'),('Isolate dependencies','Extract modules and document interfaces'),('Integrate reusable work','Connect components to destination'),('Test and document','Verify compatibility and usage')], 'Archive':[('Record current status','Summarize accomplishments and limitations'),('Preserve code and assets','Keep a stable copy'),('Document blockers','Explain why work stopped'),('Record future opportunities','Write possible next directions'),('Mark archived','Keep project searchable for later reuse')]}
   c.execute('DELETE FROM tasks WHERE project_id=?',(id,))
   for i,(title,detail) in enumerate(common[p.direction]):c.execute('INSERT INTO tasks(id,project_id,title,detail,priority,position) VALUES(?,?,?,?,?,?)',(uuid.uuid4().hex,id,title,detail,'High' if i<2 else 'Medium',i))
-  c.execute('UPDATE projects SET direction=?,status=?,updated=? WHERE id=?',(p.direction,'Archived' if p.direction=='Archive' else 'Reviving',now(),id));return rowproject(c,id)
+  c.execute('UPDATE projects SET direction=?,status=?,updated=? WHERE id=?',(p.direction,'Archived' if p.direction=='Archive' else 'Reviving',now(),id));record_project_progress(c,id);return rowproject(c,id)
 class ProjectEdit(BaseModel):
  name:str=Field(min_length=2,max_length=140)
  description:str=Field(default='',max_length=5000)
@@ -429,20 +560,20 @@ def add_task(id:str,p:NewTask):
   project=rowproject(c,id)
   pos=c.execute('SELECT COALESCE(MAX(position),-1)+1 FROM tasks WHERE project_id=?',(id,)).fetchone()[0]
   c.execute('INSERT INTO tasks(id,project_id,title,detail,priority,position) VALUES(?,?,?,?,?,?)',(uuid.uuid4().hex,id,p.title.strip(),p.detail,p.priority,pos))
-  c.execute('UPDATE projects SET status=?,updated=? WHERE id=?',('Reviving',now(),id));return rowproject(c,id)
+  c.execute('UPDATE projects SET status=?,updated=? WHERE id=?',('Reviving',now(),id));record_project_progress(c,id);return rowproject(c,id)
 @app.delete('/api/projects/{id}/tasks/{task_id}')
 def remove_task(id:str,task_id:str):
  with conn() as c:
   rowproject(c,id);r=c.execute('DELETE FROM tasks WHERE project_id=? AND id=?',(id,task_id))
   if not r.rowcount:raise HTTPException(404,'Task not found')
-  c.execute('UPDATE projects SET updated=? WHERE id=?',(now(),id));return rowproject(c,id)
+  c.execute('UPDATE projects SET updated=? WHERE id=?',(now(),id));record_project_progress(c,id);return rowproject(c,id)
 class TaskUpdate(BaseModel):done:bool
 @app.patch('/api/projects/{id}/tasks/{task_id}')
 def update_task(id:str,task_id:str,p:TaskUpdate):
  with conn() as c:
   rowproject(c,id);r=c.execute('UPDATE tasks SET done=? WHERE id=? AND project_id=?',(int(p.done),task_id,id))
   if not r.rowcount:raise HTTPException(404,'Task not found')
-  remaining=c.execute('SELECT COUNT(*) FROM tasks WHERE project_id=? AND done=0',(id,)).fetchone()[0];c.execute('UPDATE projects SET status=?,updated=? WHERE id=?',('Completed' if remaining==0 else 'Reviving',now(),id));return rowproject(c,id)
+  remaining=c.execute('SELECT COUNT(*) FROM tasks WHERE project_id=? AND done=0',(id,)).fetchone()[0];c.execute('UPDATE projects SET status=?,updated=? WHERE id=?',('Completed' if remaining==0 else 'Reviving',now(),id));record_project_progress(c,id);return rowproject(c,id)
 class Notes(BaseModel):notes:str=Field(max_length=10000)
 @app.patch('/api/projects/{id}/notes')
 def notes(id:str,p:Notes):
