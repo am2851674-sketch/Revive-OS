@@ -4,7 +4,7 @@ from urllib.parse import urlparse
 import httpx
 from fastapi import FastAPI,UploadFile,File,Form,HTTPException,Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse,JSONResponse
+from fastapi.responses import StreamingResponse,JSONResponse,FileResponse
 from pydantic import BaseModel,Field
 from reportlab.pdfgen import canvas
 ROOT=Path(__file__).resolve().parent.parent; STORE=ROOT/'storage'; STORE.mkdir(exist_ok=True); DB=STORE/'revive.db'; UPLOADS=STORE/'uploads'; UPLOADS.mkdir(exist_ok=True)
@@ -19,10 +19,15 @@ def conn():
 def init():
  with conn() as c:
   c.executescript('''CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,email TEXT NOT NULL UNIQUE,password_hash TEXT NOT NULL,name TEXT NOT NULL,created TEXT NOT NULL);CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,expires INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY,name TEXT NOT NULL,description TEXT DEFAULT '',source TEXT,repo TEXT DEFAULT '',created TEXT,updated TEXT,status TEXT DEFAULT 'Imported',direction TEXT DEFAULT '',notes TEXT DEFAULT '',analysis TEXT DEFAULT '{}');CREATE TABLE IF NOT EXISTS files(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,path TEXT NOT NULL,content TEXT DEFAULT '',size INTEGER DEFAULT 0);CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,title TEXT NOT NULL,detail TEXT DEFAULT '',priority TEXT DEFAULT 'Medium',done INTEGER DEFAULT 0,position INTEGER DEFAULT 0);''')
+  user_columns={r['name'] for r in c.execute('PRAGMA table_info(users)')}
+  if 'skills' not in user_columns:c.execute("ALTER TABLE users ADD COLUMN skills TEXT NOT NULL DEFAULT '[]'")
   columns={r['name'] for r in c.execute('PRAGMA table_info(projects)')}
-  for name,definition in [('owner_id','TEXT REFERENCES users(id) ON DELETE CASCADE'),('category',"TEXT NOT NULL DEFAULT 'Other'"),('technologies',"TEXT NOT NULL DEFAULT '[]'"),('completion','INTEGER NOT NULL DEFAULT 0'),('download_count','INTEGER NOT NULL DEFAULT 0'),('archive_path','TEXT'),('is_public','INTEGER NOT NULL DEFAULT 1')]:
+  for name,definition in [('owner_id','TEXT REFERENCES users(id) ON DELETE CASCADE'),('category',"TEXT NOT NULL DEFAULT 'Other'"),('technologies',"TEXT NOT NULL DEFAULT '[]'"),('completion','INTEGER NOT NULL DEFAULT 0'),('download_count','INTEGER NOT NULL DEFAULT 0'),('archive_path','TEXT'),('is_public','INTEGER NOT NULL DEFAULT 1'),('ai_review',"TEXT NOT NULL DEFAULT '{}'")]:
    if name not in columns:c.execute(f'ALTER TABLE projects ADD COLUMN {name} {definition}')
+  task_columns={r['name'] for r in c.execute('PRAGMA table_info(tasks)')}
+  if 'assignee_user_id' not in task_columns:c.execute('ALTER TABLE tasks ADD COLUMN assignee_user_id TEXT REFERENCES users(id) ON DELETE SET NULL')
   c.executescript('''CREATE TABLE IF NOT EXISTS download_history(id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,downloaded TEXT NOT NULL,UNIQUE(user_id,project_id));CREATE TABLE IF NOT EXISTS revival_requests(id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,message TEXT DEFAULT '',status TEXT NOT NULL DEFAULT 'Pending',created TEXT NOT NULL,UNIQUE(user_id,project_id));''')
+  c.executescript('''CREATE TABLE IF NOT EXISTS project_versions(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,version INTEGER NOT NULL,archive_path TEXT NOT NULL,note TEXT DEFAULT '',created TEXT NOT NULL,UNIQUE(project_id,version));CREATE TABLE IF NOT EXISTS project_members(project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,joined TEXT NOT NULL,PRIMARY KEY(project_id,user_id));CREATE TABLE IF NOT EXISTS project_chat(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,role TEXT NOT NULL,content TEXT NOT NULL,created TEXT NOT NULL);''')
 init()
 def now():return datetime.datetime.now(datetime.timezone.utc).isoformat()
 def hash_password(password,salt=None):
@@ -62,15 +67,19 @@ async def require_auth_and_ownership(request:Request,call_next):
   if not project:return JSONResponse({'detail':'Project not found.'},status_code=404)
   endpoint=parts[4] if len(parts)>4 else ''
   public_read=request.method=='GET' and endpoint==''
+  public_versions=request.method=='GET' and endpoint=='versions' and bool(project['is_public'])
   public_download=endpoint=='download' and bool(project['is_public'])
   public_request=endpoint=='revival-requests' and request.method=='POST' and bool(project['is_public'])
-  if not public_read and not public_download and not public_request and project['owner_id']!=user['id']:
+  with conn() as c:member=c.execute('SELECT 1 FROM project_members WHERE project_id=? AND user_id=?',(project_id,user['id'])).fetchone()
+  ai_action=parts[5] if endpoint=='ai' and len(parts)>5 else ''
+  collaborative_route=endpoint=='tasks' or (endpoint=='ai' and ai_action in ('chat','messages')) or (endpoint=='versions' and request.method=='GET')
+  if not public_read and not public_versions and not public_download and not public_request and project['owner_id']!=user['id'] and not (member and collaborative_route):
    return JSONResponse({'detail':'You do not have access to this project.'},status_code=403)
  return await call_next(request)
 def rowproject(c,id):
  r=c.execute('SELECT * FROM projects WHERE id=?',(id,)).fetchone()
  if not r:raise HTTPException(404,'Project not found')
- d=dict(r);d.pop('owner_id',None);d['technologies']=json.loads(d['technologies']);d['analysis']=json.loads(d['analysis']);d['tasks']=[dict(t) for t in c.execute('SELECT * FROM tasks WHERE project_id=? ORDER BY position',(id,))];d['files']=[{'id':f['id'],'path':f['path'],'size':f['size']} for f in c.execute('SELECT id,path,size FROM files WHERE project_id=? ORDER BY path',(id,))];d['progress']=round(100*sum(t['done'] for t in d['tasks'])/len(d['tasks'])) if d['tasks'] else 0;return d
+ d=dict(r);d.pop('owner_id',None);d['technologies']=json.loads(d['technologies']);d['analysis']=json.loads(d['analysis']);d['ai_review']=json.loads(d['ai_review']);d['tasks']=[dict(t) for t in c.execute('SELECT t.*,u.name AS assignee_name FROM tasks t LEFT JOIN users u ON u.id=t.assignee_user_id WHERE t.project_id=? ORDER BY t.position',(id,))];d['files']=[{'id':f['id'],'path':f['path'],'size':f['size']} for f in c.execute('SELECT id,path,size FROM files WHERE project_id=? ORDER BY path',(id,))];d['progress']=round(100*sum(t['done'] for t in d['tasks'])/len(d['tasks'])) if d['tasks'] else 0;return d
 def save(name,description,source,repo='',files=None,owner_id=None,category='Other',technologies=None,completion=0,archive=None):
  id=uuid.uuid4().hex;ts=now();files=files or [];archive_path=None
  if archive:
@@ -78,6 +87,8 @@ def save(name,description,source,repo='',files=None,owner_id=None,category='Othe
  with conn() as c:
   c.execute('INSERT INTO projects(id,name,description,source,repo,created,updated,owner_id,category,technologies,completion,archive_path) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(id,name.strip()[:140],description[:5000],source,repo,ts,ts,owner_id,category,json.dumps(technologies or []),max(0,min(100,int(completion))),str(archive_path) if archive_path else None))
   c.executemany('INSERT INTO files(id,project_id,path,content,size) VALUES(?,?,?,?,?)',[(uuid.uuid4().hex,id,p,content[:18000],size) for p,content,size in files])
+  if archive_path:
+   c.execute('INSERT INTO project_versions(id,project_id,version,archive_path,note,created) VALUES(?,?,?,?,?,?)',(uuid.uuid4().hex,id,1,str(archive_path),'Initial upload',ts))
  return id
 IGNORED={'.git','node_modules','dist','build','venv','.venv','__pycache__','.next','coverage'}
 EXTS={'.py','.js','.jsx','.ts','.tsx','.java','.cpp','.c','.h','.html','.css','.json','.md','.txt','.sql','.yml','.yaml','.toml','.env.example','.vue','.go','.rs'}
@@ -100,11 +111,11 @@ def parse_zip(b):
  return out
 class Manual(BaseModel):
  name:str=Field(min_length=2,max_length=140);description:str=Field(default='',max_length=5000);completed:str='';pending:str='';reason:str='';stack:str='';category:str='Other';technologies:list[str]=[];completion:int=Field(default=0,ge=0,le=100)
-class Credentials(BaseModel):email:str=Field(min_length=5,max_length=254);password:str=Field(min_length=8,max_length=128);name:str=Field(default='',min_length=1,max_length=100)
+class Credentials(BaseModel):email:str=Field(min_length=5,max_length=254);password:str=Field(min_length=8,max_length=128);name:str=Field(default='',min_length=1,max_length=100);skills:list[str]=Field(default_factory=list)
 class LoginInput(BaseModel):email:str=Field(min_length=5,max_length=254);password:str=Field(min_length=8,max_length=128)
-class ProfileInput(BaseModel):name:str=Field(min_length=1,max_length=100)
+class ProfileInput(BaseModel):name:str=Field(min_length=1,max_length=100);skills:list[str]=Field(default_factory=list)
 class RevivalRequest(BaseModel):message:str=Field(default='',max_length=2000)
-def user_payload(user):return {'user':{'id':user['id'],'email':user['email'],'name':user['name'],'created':user['created']},'token':token_for(user)}
+def user_payload(user):return {'user':{'id':user['id'],'email':user['email'],'name':user['name'],'created':user['created'],'skills':json.loads(user['skills']) if 'skills' in user.keys() else []},'token':token_for(user)}
 def parse_technologies(value):
  try:items=json.loads(value) if isinstance(value,str) else value
  except json.JSONDecodeError:items=[]
@@ -114,9 +125,9 @@ def parse_technologies(value):
 def signup(p:Credentials):
  email=p.email.strip().lower()
  if not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+',email):raise HTTPException(422,'Enter a valid email address.')
- user={'id':uuid.uuid4().hex,'email':email,'name':p.name.strip(),'created':now()}
+ user={'id':uuid.uuid4().hex,'email':email,'name':p.name.strip(),'created':now(),'skills':parse_technologies(p.skills)}
  try:
-  with conn() as c:c.execute('INSERT INTO users(id,email,password_hash,name,created) VALUES(?,?,?,?,?)',(user['id'],email,hash_password(p.password),user['name'],user['created']))
+  with conn() as c:c.execute('INSERT INTO users(id,email,password_hash,name,created,skills) VALUES(?,?,?,?,?,?)',(user['id'],email,hash_password(p.password),user['name'],user['created'],json.dumps(user['skills'])))
  except sqlite3.IntegrityError:raise HTTPException(409,'An account with this email already exists.')
  return user_payload(user)
 @app.post('/api/auth/login')
@@ -126,8 +137,8 @@ def login(p:LoginInput):
  return user_payload(user)
 @app.get('/api/auth/me')
 def me(request:Request):
- with conn() as c:user=c.execute('SELECT id,email,name,created FROM users WHERE id=?',(request.state.user['id'],)).fetchone()
- return dict(user)
+ with conn() as c:user=c.execute('SELECT id,email,name,created,skills FROM users WHERE id=?',(request.state.user['id'],)).fetchone()
+ result=dict(user);result['skills']=json.loads(result['skills']);return result
 @app.post('/api/auth/logout')
 def logout(request:Request):
  with conn() as c:c.execute('DELETE FROM sessions WHERE id=?',(request.state.user['session_id'],))
@@ -135,8 +146,8 @@ def logout(request:Request):
 @app.patch('/api/auth/profile')
 def update_profile(p:ProfileInput,request:Request):
  with conn() as c:
-  c.execute('UPDATE users SET name=? WHERE id=?',(p.name.strip(),request.state.user['id']))
-  return dict(c.execute('SELECT id,email,name,created FROM users WHERE id=?',(request.state.user['id'],)).fetchone())
+  c.execute('UPDATE users SET name=?,skills=? WHERE id=?',(p.name.strip(),json.dumps(parse_technologies(p.skills)),request.state.user['id']))
+  user=dict(c.execute('SELECT id,email,name,created,skills FROM users WHERE id=?',(request.state.user['id'],)).fetchone());user['skills']=json.loads(user['skills']);return user
 @app.get('/api/health')
 def health():return {'ok':True,'database':'sqlite'}
 @app.get('/api/projects')
@@ -214,9 +225,64 @@ def create_revival_request(id:str,p:RevivalRequest,request:Request):
 @app.get('/api/projects/{id}/revival-requests')
 def project_revival_requests(id:str):
  with conn() as c:return [dict(r) for r in c.execute('SELECT r.id,r.message,r.status,r.created,u.id AS user_id,u.name AS user_name,u.email AS user_email FROM revival_requests r JOIN users u ON u.id=r.user_id WHERE r.project_id=? ORDER BY r.created DESC',(id,))]
+class RequestDecision(BaseModel):status:str
+@app.patch('/api/projects/{id}/revival-requests/{request_id}')
+def decide_revival_request(id:str,request_id:str,p:RequestDecision):
+ if p.status not in ('Accepted','Declined'):raise HTTPException(400,'Status must be Accepted or Declined.')
+ with conn() as c:
+  r=c.execute('SELECT user_id FROM revival_requests WHERE id=? AND project_id=?',(request_id,id)).fetchone()
+  if not r:raise HTTPException(404,'Revival request not found.')
+  c.execute('UPDATE revival_requests SET status=? WHERE id=?',(p.status,request_id))
+  if p.status=='Accepted':c.execute('INSERT OR IGNORE INTO project_members(project_id,user_id,joined) VALUES(?,?,?)',(id,r['user_id'],now()))
+  else:c.execute('DELETE FROM project_members WHERE project_id=? AND user_id=?',(id,r['user_id']))
+  return {'status':p.status}
 @app.get('/api/revival-requests')
 def my_revival_requests(request:Request):
  with conn() as c:return [dict(r) for r in c.execute('SELECT r.id,r.message,r.status,r.created,p.id AS project_id,p.name AS project_name FROM revival_requests r JOIN projects p ON p.id=r.project_id WHERE r.user_id=? ORDER BY r.created DESC',(request.state.user['id'],))]
+@app.get('/api/projects/{id}/versions')
+def project_versions(id:str):
+ with conn() as c:return [dict(r) for r in c.execute('SELECT version,note,created FROM project_versions WHERE project_id=? ORDER BY version DESC',(id,))]
+@app.post('/api/projects/{id}/versions')
+async def upload_project_version(id:str,request:Request,file:UploadFile=File(...),note:str=Form('')):
+ if not file.filename or not file.filename.lower().endswith('.zip'):raise HTTPException(400,'Upload a .zip file.')
+ archive=await file.read(MAX_BYTES+1)
+ if len(archive)>MAX_BYTES:raise HTTPException(413,'ZIP must be 15MB or smaller.')
+ extracted=parse_zip(archive)
+ if not extracted:raise HTTPException(400,'No supported files were found in the ZIP.')
+ with conn() as c:
+  require_project_owner(c,id,request.state.user['id'])
+  version=c.execute('SELECT COALESCE(MAX(version),0)+1 FROM project_versions WHERE project_id=?',(id,)).fetchone()[0]
+  path=UPLOADS/f'{id}-v{version}.zip';path.write_bytes(archive);created=now()
+  c.execute('INSERT INTO project_versions(id,project_id,version,archive_path,note,created) VALUES(?,?,?,?,?,?)',(uuid.uuid4().hex,id,version,str(path),note[:300],created))
+  c.execute('UPDATE projects SET archive_path=?,updated=? WHERE id=?',(str(path),created,id));c.execute('DELETE FROM files WHERE project_id=?',(id,))
+  c.executemany('INSERT INTO files(id,project_id,path,content,size) VALUES(?,?,?,?,?)',[(uuid.uuid4().hex,id,p,content[:18000],size) for p,content,size in extracted])
+  return rowproject(c,id)
+@app.get('/api/projects/{id}/versions/{version}/download')
+def download_version(id:str,version:int):
+ with conn() as c:r=c.execute('SELECT archive_path,project_id FROM project_versions WHERE project_id=? AND version=?',(id,version)).fetchone()
+ if not r or not Path(r['archive_path']).is_file():raise HTTPException(404,'Project version not found.')
+ return FileResponse(r['archive_path'],media_type='application/zip',filename=f'revive-{id[:8]}-v{version}.zip')
+@app.get('/api/projects/{id}/matches')
+def project_matches(id:str,request:Request):
+ with conn() as c:
+  require_project_owner(c,id,request.state.user['id']);technologies=json.loads(c.execute('SELECT technologies FROM projects WHERE id=?',(id,)).fetchone()['technologies']);stack={x.casefold() for x in technologies}
+  members={r['user_id'] for r in c.execute('SELECT user_id FROM project_members WHERE project_id=?',(id,))};users=c.execute('SELECT id,name,skills FROM users WHERE id!=?',(request.state.user['id'],)).fetchall();matches=[]
+  for user in users:
+   skills=json.loads(user['skills']);overlap=[x for x in skills if x.casefold() in stack]
+   if overlap:matches.append({'user_id':user['id'],'name':user['name'],'skills':skills,'matching_skills':overlap,'score':round(100*len(overlap)/max(1,len(stack))),'member':user['id'] in members})
+  return sorted(matches,key=lambda item:(item['member'],item['score']),reverse=True)[:20]
+@app.get('/api/projects/{id}/members')
+def project_members(id:str):
+ with conn() as c:return [dict(r) for r in c.execute('SELECT u.id AS user_id,u.name,u.skills,m.joined FROM project_members m JOIN users u ON u.id=m.user_id WHERE m.project_id=? ORDER BY m.joined',(id,))]
+class TaskAssignment(BaseModel):assignee_user_id:str|None
+@app.patch('/api/projects/{id}/tasks/{task_id}/assign')
+def assign_task(id:str,task_id:str,p:TaskAssignment,request:Request):
+ with conn() as c:
+  require_project_owner(c,id,request.state.user['id'])
+  if p.assignee_user_id and not c.execute('SELECT 1 FROM project_members WHERE project_id=? AND user_id=?',(id,p.assignee_user_id)).fetchone():raise HTTPException(400,'Tasks can only be assigned to accepted project collaborators.')
+  changed=c.execute('UPDATE tasks SET assignee_user_id=? WHERE id=? AND project_id=?',(p.assignee_user_id,task_id,id))
+  if not changed.rowcount:raise HTTPException(404,'Task not found.')
+  return rowproject(c,id)
 @app.get('/api/projects/{id}/download')
 def download_project(id:str,request:Request):
  with conn() as c:
@@ -257,11 +323,77 @@ def analyse(files,description):
  context=re.search(r'pending:\s*([^\n]+)',lower)
  if context and context.group(1).strip():blockers.insert(0,'User-reported pending work: '+context.group(1).strip()[:180])
  return {'score':score,'score_label':'Heuristic readiness estimate (not verified completion)','stack':stack,'findings':findings,'blockers':blockers,'recommendation':direction,'reason':reason,'alternatives':['Continue','Restart','Pivot','Repurpose','Archive'],'file_count':len(files),'generated_at':now(),'method':'Local static heuristics; no code executed. Review recommendations manually.'}
+class Direction(BaseModel):direction:str
+async def ai_completion(messages,token_limit=1800,json_mode=False):
+ api_key=os.getenv('OPENAI_API_KEY') or os.getenv('AI_API_KEY')
+ if not api_key:raise HTTPException(503,'AI is not configured. Set OPENAI_API_KEY on the backend to enable AI features.')
+ base=os.getenv('OPENAI_BASE_URL','https://api.openai.com/v1').rstrip('/');model=os.getenv('OPENAI_MODEL','gpt-4o-mini')
+ payload={'model':model,'messages':messages,'temperature':0.2,'max_tokens':token_limit}
+ if json_mode:payload['response_format']={'type':'json_object'}
+ try:
+  async with httpx.AsyncClient(timeout=55) as client:response=await client.post(f'{base}/chat/completions',headers={'Authorization':f'Bearer {api_key}','Content-Type':'application/json'},json=payload)
+ except httpx.HTTPError:raise HTTPException(502,'Could not reach the configured AI provider.')
+ if response.status_code>=400:raise HTTPException(502,'The configured AI provider rejected the request. Check the backend model and API configuration.')
+ try:return response.json()['choices'][0]['message']['content']
+ except (KeyError,IndexError,TypeError):raise HTTPException(502,'The AI provider returned an unsupported response.')
+def ai_json(content):
+ try:return json.loads(content)
+ except (json.JSONDecodeError,TypeError):raise HTTPException(502,'The AI provider did not return valid structured data. No changes were saved.')
+def require_project_owner(c,project_id,user_id):
+ owner=c.execute('SELECT owner_id FROM projects WHERE id=?',(project_id,)).fetchone()
+ if not owner:raise HTTPException(404,'Project not found')
+ if owner['owner_id']!=user_id:raise HTTPException(403,'Only the project owner can perform this action.')
+@app.post('/api/projects/{id}/ai/doctor')
+async def ai_doctor(id:str,request:Request):
+ with conn() as c:
+  require_project_owner(c,id,request.state.user['id']);project=rowproject(c,id);files=[dict(r) for r in c.execute('SELECT path,content,size FROM files WHERE project_id=? ORDER BY path LIMIT 60',(id,))]
+ evidence='\n'.join(f"--- {f['path']} ({f['size']} bytes) ---\n{f['content'][:3500]}" for f in files)[:85000]
+ prompt={'name':project['name'],'description':project['description'],'category':project['category'],'technologies':project['technologies'],'reported_completion':project['completion'],'files':evidence}
+ content=await ai_completion([{'role':'system','content':'You are a careful software project reviewer. Base findings only on supplied project metadata and source excerpts. Do not claim to have run code. Return JSON with keys score (integer 0-100), summary (string), health (string), missing_files (array of strings), dependency_gaps (array of strings), potential_errors (array of objects with file, issue, severity), incomplete_features (array of strings), improvements (array of strings), and explanations (array of strings). Clearly label uncertain inferences.'},{'role':'user','content':json.dumps(prompt)}],2200,True)
+ review=ai_json(content)
+ if not isinstance(review,dict) or not isinstance(review.get('score'),int) or not isinstance(review.get('summary'),str):raise HTTPException(502,'The AI provider returned an incomplete project review.')
+ review['score']=max(0,min(100,review['score']));review['generated_at']=now();review['model']=os.getenv('OPENAI_MODEL','gpt-4o-mini')
+ with conn() as c:c.execute('UPDATE projects SET ai_review=? WHERE id=?',(json.dumps(review),id))
+ return review
+@app.post('/api/projects/{id}/ai/roadmap')
+async def ai_roadmap(id:str,p:Direction,request:Request):
+ with conn() as c:
+  require_project_owner(c,id,request.state.user['id']);project=rowproject(c,id)
+ prompt={'project':project['name'],'description':project['description'],'direction':p.direction,'technologies':project['technologies'],'doctor_review':project['ai_review'],'existing_analysis':project['analysis'],'files':[f['path'] for f in project['files'][:80]]}
+ content=await ai_completion([{'role':'system','content':'Create a practical project completion roadmap. Use only supplied evidence; phrase uncertain work as investigation. Return JSON object {"tasks":[{"title":"...","detail":"...","priority":"High|Medium|Low"}]}. Return 3 to 8 ordered tasks; keep titles concise and avoid generic filler.'},{'role':'user','content':json.dumps(prompt)}],1800,True)
+ items=ai_json(content).get('tasks')
+ if not isinstance(items,list) or not 3<=len(items)<=8:raise HTTPException(502,'The AI provider returned an invalid roadmap. Existing tasks were not changed.')
+ tasks=[]
+ for item in items:
+  if not isinstance(item,dict) or not str(item.get('title','')).strip():raise HTTPException(502,'The AI provider returned an invalid task. Existing tasks were not changed.')
+  priority=item.get('priority','Medium');priority=priority if priority in ('Low','Medium','High') else 'Medium'
+  tasks.append((str(item['title']).strip()[:180],str(item.get('detail','')).strip()[:2000],priority))
+ with conn() as c:
+  require_project_owner(c,id,request.state.user['id']);c.execute('DELETE FROM tasks WHERE project_id=?',(id,))
+  for index,(title,detail,priority) in enumerate(tasks):c.execute('INSERT INTO tasks(id,project_id,title,detail,priority,position) VALUES(?,?,?,?,?,?)',(uuid.uuid4().hex,id,title,detail,priority,index))
+  c.execute('UPDATE projects SET direction=?,status=?,updated=? WHERE id=?',(p.direction,'Reviving',now(),id));return rowproject(c,id)
+class ChatInput(BaseModel):message:str=Field(min_length=1,max_length=4000)
+@app.get('/api/projects/{id}/ai/messages')
+def ai_messages(id:str,request:Request):
+ with conn() as c:return [dict(r) for r in c.execute('SELECT role,content,created FROM project_chat WHERE project_id=? AND user_id=? ORDER BY created',(id,request.state.user['id']))]
+@app.post('/api/projects/{id}/ai/chat')
+async def ai_chat(id:str,p:ChatInput,request:Request):
+ with conn() as c:
+  project=rowproject(c,id);files=[dict(r) for r in c.execute('SELECT path,content FROM files WHERE project_id=? ORDER BY path LIMIT 30',(id,))]
+  history=[dict(r) for r in c.execute('SELECT role,content FROM project_chat WHERE project_id=? AND user_id=? ORDER BY created DESC LIMIT 10',(id,request.state.user['id']))]
+ context={'name':project['name'],'description':project['description'],'technologies':project['technologies'],'files':[{'path':f['path'],'excerpt':f['content'][:1800]} for f in files]}
+ messages=[{'role':'system','content':'You are the REVIVE-OS coding assistant. Help with this project using only the context below. Be direct, provide concrete suggestions and explain uncertainty. You cannot execute the code or inspect files not included here. Project context: '+json.dumps(context)}]
+ messages.extend({'role':row['role'],'content':row['content']} for row in reversed(history));messages.append({'role':'user','content':p.message.strip()})
+ answer=await ai_completion(messages,1400)
+ if not isinstance(answer,str) or not answer.strip():raise HTTPException(502,'The AI provider returned an empty response.')
+ created=now()
+ with conn() as c:
+  c.executemany('INSERT INTO project_chat(id,project_id,user_id,role,content,created) VALUES(?,?,?,?,?,?)',[(uuid.uuid4().hex,id,request.state.user['id'],'user',p.message.strip(),created),(uuid.uuid4().hex,id,request.state.user['id'],'assistant',answer.strip()[:12000],created)])
+ return {'role':'assistant','content':answer.strip(),'created':created}
 @app.post('/api/projects/{id}/analyse')
 def autopsy(id:str):
  with conn() as c:
   p=rowproject(c,id);files=[dict(r) for r in c.execute('SELECT * FROM files WHERE project_id=?',(id,))];a=analyse(files,p['description']);c.execute('UPDATE projects SET analysis=?,status=?,updated=? WHERE id=?',(json.dumps(a),'Analysed',now(),id));return rowproject(c,id)
-class Direction(BaseModel):direction:str
 @app.post('/api/projects/{id}/roadmap')
 def roadmap(id:str,p:Direction):
  if p.direction not in ['Continue','Restart','Pivot','Repurpose','Archive']:raise HTTPException(400,'Invalid direction')

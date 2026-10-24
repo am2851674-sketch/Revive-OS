@@ -49,6 +49,11 @@ function App() {
   const [inspect, setInspect] = useState(null);
   const [notes, setNotes] = useState('');
   const [revivalRequests, setRevivalRequests] = useState([]);
+  const [versions, setVersions] = useState([]);
+  const [matches, setMatches] = useState([]);
+  const [members, setMembers] = useState([]);
+  const [chatMessages, setChatMessages] = useState([]);
+  const [chatText, setChatText] = useState('');
 
   const notify = (message, kind = 'success') => {
     setToast({ message, kind });
@@ -135,10 +140,23 @@ function App() {
       setSelected(fullProject);
       setRoadmapChoice(fullProject.direction || fullProject.analysis?.recommendation || 'Continue');
       setNotes(fullProject.notes || '');
+      setVersions(await api(`/projects/${project.id}/versions`, {}, token));
       if (projects.some((item) => item.id === project.id)) {
-        setRevivalRequests(await api(`/projects/${project.id}/revival-requests`, {}, token));
+        const [requests, projectMatches, projectMembers, messages] = await Promise.all([
+          api(`/projects/${project.id}/revival-requests`, {}, token),
+          api(`/projects/${project.id}/matches`, {}, token),
+          api(`/projects/${project.id}/members`, {}, token),
+          api(`/projects/${project.id}/ai/messages`, {}, token),
+        ]);
+        setRevivalRequests(requests);
+        setMatches(projectMatches);
+        setMembers(projectMembers.map((member) => ({ ...member, skills: JSON.parse(member.skills) })));
+        setChatMessages(messages);
       } else {
         setRevivalRequests([]);
+        setMatches([]);
+        setMembers([]);
+        setChatMessages([]);
       }
     } catch (cause) {
       setError(cause.message);
